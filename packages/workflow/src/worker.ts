@@ -141,6 +141,11 @@ export type SeasonMetadataSync = (input: {
  * language fall through to the globally-passed values. No resolver → the function
  * uses its input deps unchanged (single-user / tests).
  */
+/** Asked right before a run is claimed or reserved as running. False = start nothing
+ *  now (the web process is about to be replaced by an update); queued runs stay
+ *  queued. Absent = always allowed. */
+export type MayStartRun = () => boolean;
+
 export interface AccountWorkerContext {
   storage?: StorageExecutor;
   resourceProvider?: ResourceProvider;
@@ -295,6 +300,11 @@ export async function handleWorkflowRunFailure(input: {
   //    (see worker.test "clears initial episode state when the agent model dies").
   //    A replace_request is the exception: it runs on a library that already has
   //    files, and a failed replace must leave that library exactly as it was.
+  // A staging recovery runs on a library that already has files, and its failure
+  // is not the user's problem: write no notification, and do not touch the
+  // episode bucket. The claimed copy is from queue time on InMemory, and a user
+  // run is allowed to mark episodes while this recovery sits queued.
+  const silent = claimed.workflowRun.kind === "staging_recovery";
   const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
@@ -306,7 +316,8 @@ export async function handleWorkflowRunFailure(input: {
     resourceSnapshots: willRetry ? claimed.resourceSnapshots : [],
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
-    notifications: [notification],
+    notifications: silent ? [] : [notification],
+    ...(silent ? { keepCurrentEpisodes: true } : {}),
   });
   // Brand auth (dead cookie/token) — freeze the drive so the queue refuses more
   // work until re-bound. LLM Unauthorized is NOT a brand AuthError; only the
@@ -337,8 +348,12 @@ export async function runQueuedType2Workflow(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "type2_init",
     now: now(),
@@ -478,6 +493,9 @@ export async function runScheduledType3Monitoring(input: {
    *  to keep those shows off the same drive as its bound ones when running in
    *  parallel; null when the account has no drive. */
   resolveDriveId?: (accountId: string) => Promise<string | null>;
+  /** Checked before each show's run is reserved; a false stops the rest of the sweep
+   *  from starting (those shows are reported skipped_active). */
+  mayStartRun?: MayStartRun;
 }): Promise<ScheduledType3Outcome[]> {
   const now = input.now ?? (() => new Date().toISOString());
   // Cross-account: patrol EVERY user's tracked shows, each under its owner's creds.
@@ -492,37 +510,9 @@ export async function runScheduledType3Monitoring(input: {
     ...(await input.repository.listWorksWithPendingReplacements()),
   ];
   const requestKeys = new Set(requestWorks.map(workKey));
-  for (const key of requestKeys) {
-    const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
-    try {
-      await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now, origin: "patrol" });
-    } catch (error) {
-      // One work's queueing failure must not abort the whole sweep; the next sweep retries it.
-      console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
-    }
-  }
-  // Also skip works whose replace run is already in flight: a type3 run beside it
-  // would work the same directories at the same time. This filter is only the cheap
-  // path; a replace run queued after it is caught by the patrol reservation itself
-  // (blockIfTitleHasActiveKinds).
-  const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
-  for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
-    for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
-      if (run.workflowRun.kind !== "replace_request") continue;
-      busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
-    }
-  }
-  const patrolStates = trackedStates.filter((s) => {
-    const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
-    return !requestKeys.has(key) && !busyKeys.has(key);
-  });
 
-  // One drive at a time, several drives side by side (see runKeyedPool). The key
-  // is the drive the run will actually land on: a state with no bound drive runs
-  // on its account's default drive, so it must share that drive's key, not get
-  // one of its own.
-  const concurrency = input.maxConcurrentRuns ?? 1;
-  // One lookup per account, not per show.
+  // The drive a show runs on: its bound drive, else its account's default drive (null:
+  // no drive at all → the process-wide fallback executor). One lookup per account.
   const defaultDrives = new Map<string, Promise<string | null>>();
   const defaultDriveOf = (accountId: string) => {
     let drive = defaultDrives.get(accountId);
@@ -532,6 +522,63 @@ export async function runScheduledType3Monitoring(input: {
     }
     return drive;
   };
+  // A frozen drive's login is dead: every call on it fails until the drive is re-bound.
+  // Its shows and requests wait untouched (no run, no call to the drive) and are
+  // patrolled again once the drive is active.
+  const frozenDrives = new Set<string>();
+  for (const accountId of new Set([...trackedStates, ...requestWorks].map((item) => item.accountId))) {
+    for (const storage of await input.repository.listConnectedStorages(accountId)) {
+      if (storage.status === "frozen") frozenDrives.add(storage.id);
+    }
+  }
+  const skippedOnFrozen = new Map<string, number>();
+  const onFrozenDrive = async (accountId: string, connectedStorageId: string | null) => {
+    const drive = connectedStorageId ?? (await defaultDriveOf(accountId));
+    if (drive === null || !frozenDrives.has(drive)) return false;
+    skippedOnFrozen.set(drive, (skippedOnFrozen.get(drive) ?? 0) + 1);
+    return true;
+  };
+
+  for (const key of requestKeys) {
+    const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
+    // Still in requestKeys, so the ordinary patrol leaves the work alone too.
+    if (await onFrozenDrive(accountId, drive === "" ? null : drive)) continue;
+    try {
+      await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now, origin: "patrol" });
+    } catch (error) {
+      // One work's queueing failure must not abort the whole sweep; the next sweep retries it.
+      console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
+    }
+  }
+  // Also skip a title whose replace run or leftover recovery is already active.
+  // Patrols run outside the queue drain, so either would move files in the same
+  // directories at the same time. This filter is only the cheap path; a run queued
+  // after it is caught by the patrol reservation (blockIfTitleHasActiveKinds).
+  // The janitor will not queue a recovery while any run of the title is active,
+  // so the exclusion holds both ways.
+  const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
+  for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
+    for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
+      if (run.workflowRun.kind !== "replace_request" && run.workflowRun.kind !== "staging_recovery") continue;
+      busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
+    }
+  }
+  const patrolStates: typeof trackedStates = [];
+  for (const s of trackedStates) {
+    const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
+    if (requestKeys.has(key) || busyKeys.has(key)) continue;
+    if (await onFrozenDrive(s.accountId, s.connectedStorageId)) continue;
+    patrolStates.push(s);
+  }
+  for (const [drive, count] of skippedOnFrozen) {
+    console.log(`[patrol] drive ${drive} is frozen (login expired): skipped ${count} item(s) until it is re-bound`);
+  }
+
+  // One drive at a time, several drives side by side (see runKeyedPool). The key
+  // is the drive the run will actually land on: a state with no bound drive runs
+  // on its account's default drive, so it must share that drive's key, not get
+  // one of its own.
+  const concurrency = input.maxConcurrentRuns ?? 1;
   const driveKeys =
     concurrency > 1
       ? await Promise.all(
@@ -614,6 +661,9 @@ async function patrolTrackedState(args: {
       input.staleActiveRunTimeoutMs,
     );
 
+    if (input.mayStartRun && !input.mayStartRun()) {
+      return { trackedSeasonId: season.id, status: "skipped_active" };
+    }
     const reservation = await input.repository.reserveWorkflowRun({
       accountId: state.accountId,
       connectedStorageId: state.connectedStorageId,
@@ -638,9 +688,11 @@ async function patrolTrackedState(args: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
-      // The sweep's busy-work filter is not atomic with this reservation: a replace
-      // run queued in between (现在处理) would otherwise work the same directories.
-      blockIfTitleHasActiveKinds: ["replace_request"],
+      // Patrols run outside the queue drain. A replace, or a leftover recovery the
+      // drain can claim mid-patrol, moves files in the same directories. The
+      // janitor will not queue a recovery while this patrol is active, so the
+      // exclusion holds both ways.
+      blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
       // The state was read when the sweep started (then the drive's deps, a TMDB sync):
       // a season untracked since must not be tracked again by this reservation.
       requireTrackedSeason: true,
@@ -758,6 +810,7 @@ async function patrolMovie(args: {
     createWorkflowRunId?: () => string;
     staleActiveRunTimeoutMs?: number;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
   };
   deps: {
     resourceProvider: ResourceProvider;
@@ -802,6 +855,9 @@ async function patrolMovie(args: {
     startedAt,
     input.staleActiveRunTimeoutMs,
   );
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { trackedSeasonId: state.season.id, status: "skipped_active" };
+  }
   const reservation = await input.repository.reserveWorkflowRun({
     accountId: state.accountId,
     connectedStorageId: state.connectedStorageId,
@@ -826,8 +882,8 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    // Same race as the TV patrol: a replace run queued after the sweep's filter.
-    blockIfTitleHasActiveKinds: ["replace_request"],
+    // Same as the TV patrol: a replace or a leftover recovery queued after the filter.
+    blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
     // …and an untrack after the sweep read the film.
     requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null
@@ -869,6 +925,8 @@ async function patrolMovie(args: {
       ...(deps.agentMemory === undefined
         ? {}
         : { agentMemory: deps.agentMemory }),
+      // Reported in the sweep's daily digest, like the shows, not pushed on its own.
+      notice: { trigger: "scheduled", routineIfNothingReplaced: false },
       workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
       now,
     });
@@ -967,8 +1025,12 @@ export async function runQueuedMovieAcquisition(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "movie_init",
     now: now(),
@@ -1055,8 +1117,12 @@ export async function runQueuedSeriesInitialization(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
   const claimed = await input.repository.claimNextQueuedWorkflowRun({
     kind: "type1_package_init",
     now: now(),

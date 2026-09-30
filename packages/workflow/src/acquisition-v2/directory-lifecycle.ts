@@ -1,5 +1,6 @@
 import { ensureMediaLibraryDirectory } from "../media-library-folder.js";
 import type { AuditEvent } from "../domain.js";
+import type { DrivePace } from "../drive-pacer.js";
 import type { StorageExecutor } from "../ports.js";
 
 /**
@@ -60,6 +61,69 @@ export async function ensureSeasonAcquisitionDirectories(
     parentId: showDirectoryId,
   });
   return { showDirectoryId, seasonDirectoryIds, stagingDirectoryId };
+}
+
+/** A leftover staging dir the janitor handed over, and how this run reaches it. */
+export interface StagingRecoveryDirectories {
+  showDirectoryId: string;
+  stagingDirectoryId: string;
+  /** The drive's category dirs to walk down from, most likely first. Only for drives
+   *  whose executor writes where it listed (123 / 光鸭 / 天翼); omitted on 115 / 夸克. */
+  categoryDirectoryIds?: string[];
+  /** Spaces the walk's calls and waits out the drive's rate limit (123). */
+  pace?: DrivePace;
+}
+
+/**
+ * A leftover staging dir is already the run's staging. Season dirs are resolved
+ * the same way as other runs (reuse `Season NN` when it is there, create it only
+ * when it is not). The show dir and the staging dir are not created.
+ */
+export async function bindRecoveryDirectories(
+  input: StagingRecoveryDirectories & {
+    executor: Pick<StorageExecutor, "createDirectory" | "listChildDirectories">;
+    seasons: number[];
+  },
+): Promise<AcquisitionDirectories> {
+  const pace: DrivePace = input.pace ?? (<T>(run: () => Promise<T>) => run());
+  // 123 / 光鸭 / 天翼 accept a write only into a directory this executor reached from a
+  // scope root (the category dirs) or created. The janitor's ids come from another
+  // executor, so walk down again: category → show here, show → season + staging below.
+  // A failed listing, or a show or leftover that is no longer where the janitor saw it,
+  // fails the run before the agent starts: it could not write anything here.
+  const categories = new Set(input.categoryDirectoryIds ?? []);
+  let showReached = false;
+  for (const categoryId of categories) {
+    const shows = await pace(() => input.executor.listChildDirectories(categoryId));
+    if (shows.some((show) => show.id === input.showDirectoryId)) {
+      showReached = true;
+      break;
+    }
+  }
+  if (categories.size > 0 && !showReached) {
+    throw new Error(
+      `STAGING_RECOVERY_UNREACHABLE: show dir ${input.showDirectoryId} is no longer under the drive's category dirs`,
+    );
+  }
+  const children = await pace(() => input.executor.listChildDirectories(input.showDirectoryId));
+  if (categories.size > 0 && !children.some((child) => child.id === input.stagingDirectoryId)) {
+    throw new Error(
+      `STAGING_RECOVERY_UNREACHABLE: staging dir ${input.stagingDirectoryId} is no longer under show dir ${input.showDirectoryId}`,
+    );
+  }
+  const seasonDirectoryIds: Record<number, string> = {};
+  for (const season of input.seasons) {
+    const name = `Season ${String(season).padStart(2, "0")}`;
+    const existing = children.find((child) => child.name === name);
+    seasonDirectoryIds[season] = existing
+      ? existing.id
+      : await pace(() => input.executor.createDirectory({ name, parentId: input.showDirectoryId }));
+  }
+  return {
+    showDirectoryId: input.showDirectoryId,
+    seasonDirectoryIds,
+    stagingDirectoryId: input.stagingDirectoryId,
+  };
 }
 
 /**
@@ -250,6 +314,14 @@ export async function withStagingCleanup<T>(
     /** Non-null: files whose move failed are still only in staging. Do not remove
      *  the dir (a kept dir would also look like a leak, so skip the read-back). */
     keep?: () => { fileCount: number } | null;
+    /** A recovery adopted an existing leftover. A throw must leave that dir
+     *  where it is. */
+    preserveOnThrow?: boolean;
+    /** Recovery only. A normal return discards the adopted dir only when this
+     *  is true (the agent called finish or discardStaging). Anything else keeps
+     *  it for a later sweep. Absent on an ordinary run, whose fresh staging is
+     *  always discarded. */
+    discardOnNormalReturn?: () => boolean;
     onKept?: (event: StagingKeptUnmoved) => void;
   },
   run: () => Promise<T>,
@@ -275,6 +347,15 @@ export async function withStagingCleanup<T>(
         if (threw) {
           attachStagingKeptUnmoved(bodyError, [event]);
         }
+        return;
+      }
+      // No unmoved files to report. A thrown recovery must not delete the
+      // adopted leftover. A normal return deletes it only after finish or
+      // discardStaging; any other exit leaves it for the next sweep.
+      if (threw && args.preserveOnThrow) {
+        return;
+      }
+      if (!threw && args.discardOnNormalReturn && !args.discardOnNormalReturn()) {
         return;
       }
       let removalFailed = false;

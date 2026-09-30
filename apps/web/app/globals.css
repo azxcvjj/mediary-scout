@@ -3728,9 +3728,6 @@ select.setting-control {
   padding: 8px 12px;
   font-size: 12px;
 }
-.attention-item-prompt {
-  margin-top: 8px;
-}
 .attention-item-dismiss {
   flex: 0 0 auto;
   border: none;
@@ -3769,81 +3766,6 @@ select.setting-control {
   color: #06210f;
 }
 
-/* ---------- deployment update hint (self-host compose, Settings top) ---------- */
-.update-card {
-  max-width: 720px;
-  margin-bottom: 24px;
-  background: rgba(30, 215, 96, 0.08);
-  border: 1px solid rgba(30, 215, 96, 0.25);
-  border-radius: var(--radius-card);
-  padding: 16px;
-}
-.update-card-heading {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--accent);
-  margin-bottom: 8px;
-}
-.update-card p {
-  color: var(--text-soft);
-}
-.update-card code {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-.update-card-actions {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-.update-card .ghost-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.update-link {
-  text-decoration: none;
-}
-.update-copy-textarea {
-  width: 100%;
-  margin-top: 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.25);
-  color: var(--text-soft);
-  padding: 10px;
-  font: inherit;
-  resize: vertical;
-}
-.update-copy-block {
-  min-width: 180px;
-}
-.update-prompt-details {
-  margin-top: 10px;
-  font-size: 12px;
-}
-.update-prompt-details summary {
-  color: var(--text-muted);
-  cursor: pointer;
-  list-style: none;
-}
-.update-prompt-details summary::-webkit-details-marker {
-  display: none;
-}
-.update-prompt-details pre {
-  white-space: pre-wrap;
-  color: var(--text-soft);
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 10px;
-  max-width: 520px;
-}
 
 /* ---------- GitHub nameplate (Settings page bottom — quiet 暗记 + CTA) ---------- */
 .github-nameplate {
@@ -3986,6 +3908,9 @@ select.setting-control {
 .update-faint { font-size: 12px; color: var(--text-faint); }
 .update-muted { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
 .update-muted a { color: var(--text); }
+.update-download { margin-top: 14px; }
+.update-download .primary-button { text-decoration: none; }
+.update-download .update-muted { margin-top: 8px; }
 .update-log-title { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; }
 .update-release { border-top: 1px solid var(--divider); padding: 10px 0; }
 .update-release:first-of-type { border-top: 0; }
@@ -3997,6 +3922,18 @@ select.setting-control {
 .update-kind { position: absolute; left: 0; top: 2px; font-size: 10.5px; font-weight: 600; color: var(--text-faint); }
 .update-kind.is-add { color: var(--accent); }
 .update-kind.is-fix { color: var(--info); }
+.update-status-side { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.update-progress { margin-top: 12px; }
+.update-bar { height: 4px; border-radius: 2px; background: var(--bg-card); margin-top: 8px; overflow: hidden; }
+.update-bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.4s var(--ease-out, ease-out); }
+.update-now { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.update-cmd { margin: 8px 0 0; padding: 10px 12px; border-radius: var(--radius-card); background: var(--bg-raised); font-size: 12.5px; overflow-x: auto; }
+.update-warn { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--warning); }
+.update-failure summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); }
+.update-migrate .ghost-button { margin-top: 8px; }
+.update-auto-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.update-auto-row .service-toggle { font-size: 13.5px; color: var(--text); }
+.update-auto-row .setting-control { width: auto; }
 
 /* 搜索页空态「近期热门」发现区(#95)。Tab 药丸复用 .filter-pill。 */
 .trending {
@@ -4292,6 +4229,9 @@ select.setting-control {
 .drive-card-actions .secondary-button {
   font-size: 12px;
   padding: 3px 10px;
+  /* A long 测试连接 result sits beside the button: let the message wrap, never the label. */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .drive-add-heading {

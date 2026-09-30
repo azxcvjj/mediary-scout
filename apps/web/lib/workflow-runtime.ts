@@ -42,6 +42,7 @@ import {
   enqueueUrgentReplaceRequests,
   runQueuedMovieAcquisition,
   runQueuedReplaceRequest,
+  runQueuedStagingRecovery,
   runQueuedSeriesInitialization,
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
@@ -101,6 +102,18 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
+import { DEFAULT_AUTO_UPDATE_TIME, isAutoUpdateTime, shouldAutoUpdate } from "./auto-update-schedule";
+
+/** Checked by the workflow package right before each claim or patrol reservation, not
+ *  only at entry: the updater can take the hold while a tick is still setting up. */
+const mayStartRun = () => !isUpdateHoldActive(Date.now());
+
+/** True while the updater holds new work before a container swap. Lets server actions
+ *  (e.g. importForeignWorkAction) refuse upfront without importing update-hold directly. */
+export function isUpdateInProgress(): boolean {
+  return isUpdateHoldActive(Date.now());
+}
 
 export type CandidateTrackingRequestResult =
   | {
@@ -486,6 +499,16 @@ export class UnauthenticatedAccountError extends Error {
   }
 }
 
+/** Thrown when a drive mutation is refused because an update is about to swap the web
+ *  container. Rechecked INSIDE the in-flight guard so the updater's busy check cannot miss
+ *  it: the caller turns it into a "try again after the update" message. */
+export class UpdateInProgressError extends Error {
+  constructor(message = "正在更新，更新完成后再试。") {
+    super(message);
+    this.name = "UpdateInProgressError";
+  }
+}
+
 let sessionSecretCache: string | null = null;
 
 /** The HMAC secret for session cookies: env override, else a generated value
@@ -805,7 +828,7 @@ export async function queueCandidateTracking(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   const movieTmdbId = parseMovieCandidateId(candidateId);
   if (movieTmdbId !== null) {
@@ -980,6 +1003,16 @@ export function __resetPanSouHealthCacheForTests(): void {
 }
 
 export async function runNextQueuedWorkflow() {
+  // An update is about to replace this process: start nothing new. Queued runs stay
+  // queued and run on the new version.
+  if (isUpdateHoldActive(Date.now())) {
+    return { status: "idle" as const };
+  }
+  // In flight for the updater's busy check, from here to the claim it guards.
+  return whileInFlight(runNextQueuedWorkflowNow);
+}
+
+async function runNextQueuedWorkflowNow() {
   const repository = getWorkflowRepository();
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -1016,6 +1049,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (type2.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1032,6 +1066,7 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (series.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1047,6 +1082,7 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
   });
   if (movie.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
@@ -1064,13 +1100,26 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
     // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
     ...syncOption(),
   });
   if (replace.status !== "idle") {
     await pushNotificationsSince(repository, startedAt);
+    return replace;
   }
-  return replace;
+  // Leftover staging heals itself. No notification and no push.
+  return runQueuedStagingRecovery({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+    mayStartRun,
+  });
 }
 
 /** The user's preferred subtitle language for acquisition search, or undefined
@@ -1477,7 +1526,7 @@ export async function reserveCandidate(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再预定。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "预定") };
   }
   const request = await reserveMovie({
     title: movie.title,
@@ -1594,7 +1643,7 @@ export async function queueCandidateSeries(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
     const target = await prepareSeriesTarget({
@@ -1702,6 +1751,102 @@ export function beijingDateTime(): { date: string; hhmm: string } {
   return { date: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
 }
 
+export const AUTO_UPDATE_ENABLED_SETTING_KEY = "auto_update_enabled";
+export const AUTO_UPDATE_TIME_SETTING_KEY = "auto_update_time";
+const AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY = "auto_update_last_attempt";
+export const AUTO_UPDATE_FAIL_STREAK_SETTING_KEY = "auto_update_fail_streak";
+
+/** The auto-update switch and its hour (Beijing time). Off unless explicitly turned on;
+ *  a missing or malformed hour (anything but a whole hour) reads as the 04:00 default. */
+export async function getAutoUpdateSettings(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<{ enabled: boolean; time: string }> {
+  return { enabled: await isAutoUpdateEnabled(repository), time: await getAutoUpdateTime(repository) };
+}
+
+async function isAutoUpdateEnabled(repository: { getSetting(key: string): Promise<string | null> }): Promise<boolean> {
+  return (await repository.getSetting(AUTO_UPDATE_ENABLED_SETTING_KEY))?.trim() === "1";
+}
+
+async function getAutoUpdateTime(repository: { getSetting(key: string): Promise<string | null> }): Promise<string> {
+  const time = (await repository.getSetting(AUTO_UPDATE_TIME_SETTING_KEY))?.trim();
+  return time && isAutoUpdateTime(time) ? time : DEFAULT_AUTO_UPDATE_TIME;
+}
+
+/** Failed attempts at one release. `at` is when the last counted attempt ended: one failed
+ *  attempt is counted once, however many days its status stays on the updater. */
+interface AutoUpdateFailStreak {
+  tag: string;
+  count: number;
+  at: string;
+}
+
+function parseAutoUpdateFailStreak(raw: string | null): AutoUpdateFailStreak | null {
+  if (!raw?.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutoUpdateFailStreak> | null;
+    if (
+      parsed &&
+      typeof parsed.tag === "string" &&
+      typeof parsed.count === "number" &&
+      Number.isInteger(parsed.count) &&
+      parsed.count > 0
+    ) {
+      return { tag: parsed.tag, count: parsed.count, at: typeof parsed.at === "string" ? parsed.at : "" };
+    }
+  } catch {
+    // A hand-edited or damaged value counts as no failures.
+  }
+  return null;
+}
+
+/** Daily auto-update. The worker calls this every tick (3 s): with the switch off it reads
+ *  one setting and returns, and it looks at GitHub and the updater once a day, after the
+ *  set hour. The day is used up whatever the outcome (no update, offline, a state that says
+ *  wait): the next look is tomorrow. */
+export async function runAutoUpdateIfDue(): Promise<void> {
+  if (isDemoMode() || resolveIsDesktop()) return;
+  const repository = getWorkflowRepository();
+  // Off by default and asked every tick: read the switch alone first.
+  if (!(await isAutoUpdateEnabled(repository))) return;
+  const time = await getAutoUpdateTime(repository);
+  const { date, hhmm } = beijingDateTime();
+  const lastAttemptDate = (await repository.getSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY))?.trim() ?? null;
+  if (hhmm < time || lastAttemptDate === date) return;
+  await repository.setSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY, date);
+  // Dynamic: update-view-server imports this module.
+  const { loadUpdateView } = await import("./update-view-server");
+  const { requestUpdate } = await import("./updater-client");
+  const view = await loadUpdateView();
+  if (!view.updater || !view.available) return;
+  const tag = view.available.tag;
+  let failStreak = parseAutoUpdateFailStreak(await repository.getSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY));
+  // The last attempt at this same release failed: count it (once) before deciding.
+  if (view.updater.targetTag === tag && (view.updater.phase === "rolled_back" || view.updater.phase === "failed")) {
+    const at = view.updater.finishedAt ?? view.updater.startedAt ?? "";
+    if (!failStreak || failStreak.tag !== tag) {
+      failStreak = { tag, count: 1, at };
+    } else if (failStreak.at !== at) {
+      failStreak = { tag, count: failStreak.count + 1, at };
+    }
+    await repository.setSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY, JSON.stringify(failStreak));
+  }
+  const due = shouldAutoUpdate({
+    enabled: true,
+    time,
+    now: { date, hhmm },
+    lastAttemptDate,
+    available: tag,
+    failStreak,
+    updater: view.updater,
+    updateHoldActive: isUpdateHoldActive(Date.now()),
+  });
+  if (!due) return;
+  const result = await requestUpdate(tag);
+  if (result.ok) console.log(`[auto-update] started ${tag}`);
+  else console.warn(`[auto-update] ${tag} not started: ${result.reason}`);
+}
+
 /**
  * 每日巡检（per-slot 认领 + 合并补跑）。任何触发源（worker tick / cron / 手动）都
  * 打这里：每次找出「已到点且今天未认领」的时间点，一次性全部认领并只跑一次 sweep
@@ -1709,13 +1854,24 @@ export function beijingDateTime(): { date: string; hhmm: string } {
  * 容器同一语义（原 ignoreTimeGate 特例已退役）。`force` 跑完整 sweep 但不认领任何
  * slot（run-now 不得吞掉计划任务）。
  */
-export async function runScheduledType3(options?: {
-  force?: boolean;
-}): Promise<{
+type ScheduledType3Result = {
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "update_in_progress";
   scheduledFor?: string;
-}> {
+};
+
+export async function runScheduledType3(options?: { force?: boolean }): Promise<ScheduledType3Result> {
+  // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
+  // on the new version once the update is done.
+  if (isUpdateHoldActive(Date.now())) {
+    return { skipped: "update_in_progress", outcomes: [] };
+  }
+  // In flight for the updater's busy check: reservations and staging cleanup must not
+  // be cut by a swap. The manual 立即巡检 and cron routes come through here too.
+  return whileInFlight(() => runScheduledType3Now(options));
+}
+
+async function runScheduledType3Now(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];
@@ -1761,6 +1917,9 @@ export async function runScheduledType3(options?: {
     );
   }
   let result: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  // Set when an update hold stopped a show from being reserved mid-sweep: the sweep is
+  // then not complete, and its slots must stay open for the new version.
+  let heldBack = false;
   try {
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
@@ -1782,19 +1941,42 @@ export async function runScheduledType3(options?: {
       resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
+      mayStartRun: () => {
+        const allowed = mayStartRun();
+        if (!allowed) heldBack = true;
+        return allowed;
+      },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+    // so the new version patrols the rest today. Seasons that did run are only re-checked.
+    const stopForUpdate = async () => {
+      if (claimedNow.length > 0) {
+        await repository.setSetting(
+          LAST_SWEEP_CLAIMS_SETTING_KEY,
+          JSON.stringify({ date: claimDate, slots: priorClaims }),
+        );
+      }
+      await pushNotificationsSince(repository, startedAt, { sweep: true });
+      return { skipped: "update_in_progress" as const, outcomes: result };
+    };
+    if (heldBack) return await stopForUpdate();
     try {
-      await sweepOrphanStagingDirs({
+      const janitor = await sweepOrphanStagingDirs({
         repository,
         drives: await stagingJanitorDrives(),
         now: new Date().toISOString(),
+        mayStartRun,
       });
+      if (janitor.held) heldBack = true;
     } catch (error) {
       console.error(
         `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    // The janitor stopped for an update, or the hold started after both had passed their
+    // checks: either way the new version should run today's sweep, so do not mark it done.
+    if (heldBack || !mayStartRun()) return await stopForUpdate();
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
     await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
@@ -2300,17 +2482,24 @@ async function getAccountStorageCredentials(
 async function resolveQueueStorage(
   accountId: string,
   explicitConnectedStorageId?: string | null,
-): Promise<{ id: string | null; frozen: boolean; unknown: boolean }> {
+): Promise<{ id: string | null; frozen: boolean; unknown: boolean; provider: string | null }> {
   try {
     const storages = (await getWorkflowRepository().listConnectedStorages(accountId)).filter(
       (storage) => isRegisteredStorageProvider(storage.provider),
     );
-    return resolveQueueStorageChoice(storages, explicitConnectedStorageId);
+    const choice = resolveQueueStorageChoice(storages, explicitConnectedStorageId);
+    return { ...choice, provider: storages.find((storage) => storage.id === choice.id)?.provider ?? null };
   } catch {
     // Fail closed: transient DB errors must not queue unscoped or drop an
     // explicit workspace pin (would land on the wrong drive).
-    return { id: null, frozen: false, unknown: true };
+    return { id: null, frozen: false, unknown: true, provider: null };
   }
+}
+
+/** Refusal for a queue/reserve action on a drive whose login died: re-scan THAT brand. */
+function frozenDriveMessage(provider: string | null, action: "获取" | "预定"): string {
+  const label = provider ? getStorageBrand(provider).label : "网盘";
+  return `该网盘已掉线，请重新扫码绑定同一个${label}后再${action}。`;
 }
 
 /** Marks a drive frozen — its cookie died. Called when a worker/probe hits a
@@ -2713,17 +2902,27 @@ export async function importForeignWorkFiles(input: {
   movieTitle: string;
   year: number;
 }): Promise<{ movieDirectoryId: string; movedFileIds: string[] }> {
-  // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
-  // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
-  // `{tmdb-N}` only when a caller passes tmdbId.
-  const accountId = await getCurrentAccountId();
-  const parents = await getWorkerStorageParents(accountId);
-  return importForeignWorkAsMovie({
-    storage: await getWorkerStorageExecutor(accountId),
-    providerFileIds: input.providerFileIds,
-    movieTitle: input.movieTitle,
-    year: input.year,
-    moviesParentDirectoryId: parents.movies,
+  // Count as in flight: this creates a folder and moves files on the drive. A container
+  // swap mid-way would leave the folder made and the files half moved, and the retry
+  // then fails. /api/update/busy waits for this to settle before the updater swaps.
+  return whileInFlight(async () => {
+    // Recheck the hold now that this import is counted in flight. The action checks it too,
+    // but between that check and this increment the updater could take the hold and see
+    // inFlightCount() === 0 (busy:false), then swap mid-move. Ordering the increment before
+    // this check closes that gap: if the hold is on here, the swap has not been cleared yet.
+    if (isUpdateHoldActive(Date.now())) throw new UpdateInProgressError();
+    // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
+    // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
+    // `{tmdb-N}` only when a caller passes tmdbId.
+    const accountId = await getCurrentAccountId();
+    const parents = await getWorkerStorageParents(accountId);
+    return importForeignWorkAsMovie({
+      storage: await getWorkerStorageExecutor(accountId),
+      providerFileIds: input.providerFileIds,
+      movieTitle: input.movieTitle,
+      year: input.year,
+      moviesParentDirectoryId: parents.movies,
+    });
   });
 }
 
@@ -2866,6 +3065,20 @@ export class StorageOwnedByOtherAccountError extends Error {
   }
 }
 
+/** A same-account re-login is the re-bind a 掉线 card asks for (「重新绑定即恢复」): store the
+ *  fresh credential and bring the drive back. The upsert deliberately keeps the status,
+ *  so the unfreeze is explicit here; until it runs, patrol and acquisition skip the drive. */
+async function refreshConnectedStorage(
+  repository: ReturnType<typeof getWorkflowRepository>,
+  existing: { id: string; status: "active" | "frozen" },
+  row: Parameters<ReturnType<typeof getWorkflowRepository>["upsertConnectedStorage"]>[0],
+): Promise<void> {
+  await repository.upsertConnectedStorage(row);
+  if (existing.status === "frozen") {
+    await repository.setConnectedStorageStatus(existing.id, "active", null, null);
+  }
+}
+
 /**
  * Shared bind skeleton for the two TOKEN brands (光鸭/天翼): enforce instance-wide
  * ownership, then refresh-or-insert the connected_storage row. The parts that
@@ -2910,7 +3123,7 @@ async function bindTokenConnectedStorage(input: {
   const payload = { ...credentialBlob, meta };
   if (decision.action === "refresh" && existing) {
     // Same account re-login → refresh the credential blob, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
       provider,
@@ -2987,7 +3200,7 @@ async function bindPan115ConnectedStorage(input: {
   };
   if (decision.action === "refresh" && existing) {
     // Keep the already-resolved directory CIDs; only refresh the cookie.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId: input.accountId,
       provider: "pan115",
@@ -3133,7 +3346,7 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
   const payload = { cookie, meta: { connectedAt: new Date().toISOString() } };
   if (decision.action === "refresh" && existing) {
     // Same account re-bind → refresh the cookie, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
       provider: "quark",

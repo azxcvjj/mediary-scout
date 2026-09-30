@@ -567,6 +567,109 @@ export async function runReplaceRequestV2AndPersist(
 }
 
 /**
+ * A leftover staging dir, judged by the agent and persisted like any other TV run.
+ * No notification. The lock season keeps the claimed run id; other seasons get a
+ * sibling record so their obtained marks land. Each of those writes is skipped
+ * when the season was untracked while this hidden run was going — the untrack wins.
+ * Memory reflection is skipped inside the engine (`stagingRecovery`).
+ */
+export async function runStagingRecoveryV2AndPersist(
+  input: TvV2Common & {
+    seasons: Array<{ season: TrackedSeason; episodes: EpisodeState[] }>;
+    lockSeasonNumber: number;
+    lockAuditEvents: AuditEvent[];
+    stagingRecovery: NonNullable<RunTvAcquisitionV2Request["stagingRecovery"]>;
+  },
+): Promise<BridgedV2Result> {
+  const now = resolveNow(input);
+  const priorObtained = input.seasons.flatMap((entry) =>
+    entry.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
+  );
+  const bridged = await runTvAcquisitionV2({
+    title: input.title,
+    mode: "type3",
+    seasons: input.seasons.map(({ season }) => ({
+      seasonNumber: season.seasonNumber,
+      totalEpisodes: season.totalEpisodes,
+      latestAiredEpisode: season.latestAiredEpisode,
+      qualityPreference: season.qualityPreference,
+      status: season.status,
+    })),
+    categoryParentId: input.categoryParentId,
+    resourceProvider: input.resourceProvider,
+    storage: input.storage,
+    deadLinkStore: input.repository,
+    model: input.model,
+    workflowRunId: input.workflowRun.id,
+    priorObtained,
+    stagingRecovery: input.stagingRecovery,
+    now,
+    onProgress: progressAndTraceSink({
+      repository: input.repository,
+      workflowRunId: input.workflowRun.id,
+      neededHint: Math.max(1, input.seasons.reduce((sum, entry) => sum + entry.season.totalEpisodes, 0)),
+      storage: input.storage,
+    }),
+    ...passthrough(input),
+  });
+
+  const lock = bridged.seasons.find((entry) => entry.season.seasonNumber === input.lockSeasonNumber);
+  if (!lock) {
+    throw new Error(`STAGING_RECOVERY_LOCK_SEASON_MISSING: season ${input.lockSeasonNumber} is not among the run's seasons`);
+  }
+  const owner = {
+    ...(input.accountId ? { accountId: input.accountId } : {}),
+    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+  };
+  const finishedAt = now();
+  for (const seasonResult of bridged.seasons) {
+    if (seasonResult === lock) continue;
+    const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    await input.repository.saveWorkflowRunSnapshot({
+      ...owner,
+      title: input.title,
+      season: seasonResult.season,
+      workflowRun: {
+        id: runId,
+        kind: "staging_recovery",
+        status: bridged.status,
+        trackedSeasonId: seasonResult.season.id,
+        startedAt: input.workflowRun.startedAt,
+        finishedAt,
+        auditEvents: [],
+      },
+      episodes: seasonResult.episodes,
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+      requireTrackedSeason: true,
+    });
+  }
+  await input.repository.saveWorkflowRunSnapshot({
+    ...owner,
+    title: input.title,
+    season: lock.season,
+    workflowRun: {
+      id: input.workflowRun.id,
+      kind: "staging_recovery",
+      status: bridged.status,
+      trackedSeasonId: lock.season.id,
+      startedAt: input.workflowRun.startedAt,
+      finishedAt,
+      auditEvents: [...input.lockAuditEvents, ...bridged.auditEvents],
+    },
+    episodes: lock.episodes,
+    resourceSnapshots: bridged.resourceSnapshots,
+    decisions: bridged.decisions,
+    transferAttempts: bridged.transferAttempts,
+    notifications: [],
+    requireTrackedSeason: true,
+  });
+  return { ...bridged, notifications: [] };
+}
+
+/**
  * holdLockOpen (replace runs): the run's own record is saved with status `running` —
  * episodes and evidence written, no notification — and finishLockRun writes the
  * terminal record (status, finishedAt, notification). The caller makes that its very
@@ -662,7 +765,8 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   userRequest?: RunMovieAcquisitionV2Request["userRequest"];
   /** Replace runs: whether the film was obtained before (see RunMovieAcquisitionV2Request). */
   priorObtained?: boolean;
-  /** Replace runs: how the notification is pushed (see stampReplaceNotification). */
+  /** How the notification is pushed (see stampReplaceNotification): replace runs, and
+   *  the patrol's film runs (scheduled, into the daily digest). */
   notice?: ReplaceNotice;
   /** Replace runs: see HeldLockRun. */
   holdLockOpen?: boolean;
